@@ -101,6 +101,16 @@ title = {Language Modeling Materializes a World Model of Protein Biology},
 year = {2026},
 comment = {ESMFold2 weights}
 }""",
+    "Vaitl2026": """@article{Vaitl2026,
+author = {Vaitl, Lorenz and Tanasijevic, Ivan and Jamasb, Arian Rokkum and Mille-Fragoso, L. Santiago and Kessel, Pan},
+title = {{Recycle only when you have to!}},
+journal = {arXiv},
+year = {2026},
+eprint = {2610.40665},
+archivePrefix = {arXiv},
+primaryClass = {q-bio.QM},
+comment = {CycleCritic recycle gating}
+}""",
     "Mitchell2019": """@article{Mitchell2019,
 author = {Mitchell, Alex L and Almeida, Alexandre and Beracochea, Martin and Boland, Miguel and Burgin, Josephine and Cochrane, Guy and Crusoe, Michael R and Kale, Varsha and Potter, Simon C and Richardson, Lorna J and Sakharova, Ekaterina and Scheremetjew, Maxim and Korobeynikov, Anton and Shlemov, Alex and Kunyavskaya, Olga and Lapidus, Alla and Finn, Robert D},
 doi = {10.1093/nar/gkz1035},
@@ -240,6 +250,7 @@ def write_bibtex(
     use_amber: bool,
     result_dir: Path,
     bibtex_file: str = "cite.bibtex",
+    use_cyclecritic: bool = False,
 ) -> Path:
     to_cite = ["Mirdita2021"]
     if model == "alphafold2_ptm" or model == "alphafold2":
@@ -263,6 +274,8 @@ def write_bibtex(
         to_cite += ["Berman2003"]
     if use_amber:
         to_cite += ["Eastman2017"]
+    if use_cyclecritic:
+        to_cite += ["Vaitl2026"]
 
     bibtex_file = result_dir.joinpath(bibtex_file)
     with bibtex_file.open("w", encoding="utf-8") as writer:

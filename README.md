@@ -255,6 +255,25 @@ The previously introduced `--use-pallas` parameter is accepted as an alias for `
 
 The `--compile-mode` flag trades compile time against folding speed. The difference is small (1-5%), but can matter for very large batches or very long sequences. `fast` and `tuned` (default) skip or reduce the compile optimization effort. `full` is unbounded and can take tens of minutes, but that cost can amortize over hundreds of predictions.
 
+### Stopping hopeless refolds early: CycleCritic
+
+When screening designed binders, most of the compute goes on candidates that were never going to pass. [Recycle only when you have to!](https://arxiv.org/abs/2610.40665) shows that a refold's final confidence and self-consistency can be read off the trunk several recycles early, so `--cyclecritic` scores the trunk after every recycle and stops a refold that will not clear the filters, before diffusion and the confidence head run. AlphaFold3-family models only.
+
+```bash
+# record what the critics say at every recycle, killing nothing
+colabfold_batch --model-type protenix2 --cyclecritic --cyclecritic-trace \
+    --cyclecritic-design design.cif --cyclecritic-binder-chain B input.fasta out/
+
+# then gate on thresholds calibrated from those traces
+colabfold_batch --model-type protenix2 --cyclecritic \
+    --cyclecritic-design design.cif --cyclecritic-binder-chain B \
+    --cyclecritic-structure-thresholds 3.2,3.0,2.8 input.fasta out/
+```
+
+The structure critic scores the trunk's distogram against the designed backbone (`--cyclecritic-design`, or `--initial-guess`) and kills above its threshold; the confidence critic scores how constrained the trunk's interface belief is and kills below its threshold, needing no reference. Thresholds are per recycle, held at the last value, and are not shipped: their scale depends on the model, the target and the design pipeline, so calibrate them on refolds whose outcome you know. Without thresholds the critics only score and report, into `<job>_cyclecritic.json`.
+
+The gate is kill-only, so a refold that survives is folded exactly as it would have been without it.
+
 ### Tutorials & Presentations
 - ColabFold Tutorial presented at the Boston Protein Design and Modeling Club. [[video]](https://www.youtube.com/watch?v=Rfw7thgGTwI) [[slides]](https://docs.google.com/presentation/d/1mnffk23ev2QMDzGZ5w1skXEadTe54l8-Uei6ACce8eI).
 

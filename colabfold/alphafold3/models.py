@@ -137,26 +137,112 @@ class ModelRunner:
         except Exception:
             pass
 
-    def run_inference(self, featurised_example, rng_key):
+    def _to_device(self, featurised_example):
         import jax
         import jax.numpy as jnp
         from alphafold3.model.components import utils
 
-        featurised_example = jax.device_put(
+        return jax.device_put(
             jax.tree_util.tree_map(jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)),
             self._device,
         )
-        result = self._model()(rng_key, featurised_example)
+
+    def _to_host(self, result):
+        import jax
+        import jax.numpy as jnp
+
         result = jax.tree.map(np.asarray, result)
         result = jax.tree.map(
             lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x, result)
         result = dict(result)
-        # alphafold3 writes this into the output mmCIF and refuses to build a result
-        # without it; converted weights carry one, a hand-made blob may not
         meta = self.model_params.get("__meta__", {}).get("__identifier__")
         result["__identifier__"] = (np.asarray(meta).tobytes() if meta is not None
                                     else self.model_name.encode())
         return result
+
+    def run_inference(self, featurised_example, rng_key):
+        result = self._model()(rng_key, self._to_device(featurised_example))
+        return self._to_host(result)
+
+    @property
+    def num_trunk_passes(self) -> int:
+        from alphafold3.model.model import num_trunk_passes
+
+        return num_trunk_passes(self._config.num_recycles, self.model_name)
+
+    @property
+    def distogram_config(self):
+        return self._config.heads.distogram
+
+    @functools.cached_property
+    def _stages(self):
+        """The trunk one pass at a time, plus the distogram and the heads.
+
+        The fused graph recycles inside a ``fori_loop``, so nothing on the host
+        sees the trunk between passes and a gate has nowhere to stand. These are
+        alphafold3's own separable stages (``alphafold3.model.staged``): the
+        recycle count never reaches a graph, so one executable serves every pass
+        and a Python driver can look at the trunk after each one.
+
+        ``distogram`` is the frozen distogram head applied to the carry -- one
+        linear over the pair representation -- run through haiku so it picks up
+        the checkpoint's own parameters rather than a copy of them. It returns the
+        distogram's logits, which the critics read; the ``trunk`` stage returns
+        contact probabilities only.
+        """
+        import copy
+
+        import haiku as hk
+        import jax
+        from alphafold3.model import model
+
+        def stage(name, *, structure=True, config=None):
+            config = config if config is not None else self._config
+
+            @hk.transform
+            def forward(batch, carry=None, key=None):
+                def run():
+                    return model.Model(config)(
+                        batch, key=key, use_dropout=self._use_dropout,
+                        recycle_carry=carry, stage=name, structure=structure)
+                if self._fused_layer_norm:
+                    from colabfold.alphafold3.layer_norm import interceptor
+
+                    with hk.intercept_methods(interceptor):
+                        return run()
+                return run()
+
+            return jax.jit(forward.apply, device=self._device)
+
+        distogram_config = copy.deepcopy(self._config)
+        distogram_config.return_distogram = True
+        return {
+            "embed": stage("embed"),
+            "trunk": stage("trunk"),
+            "distogram": stage("heads", structure=False, config=distogram_config),
+            "score": stage("score"),
+        }
+
+    def run_inference_gated(self, featurised_example, rng_key, gate):
+        """Recycle under a :class:`colabfold.alphafold3.cyclecritic.CycleGate`.
+
+        Runs the trunk pass by pass, asking the gate after each one whether this
+        refold is worth continuing. Returns the same result dict
+        :meth:`run_inference` does, or None when the gate stopped the refold --
+        in which case neither diffusion nor the confidence head ever ran.
+        """
+        batch = self._to_device(featurised_example)
+        stages = self._stages
+        self._preinit_tokamax_context()
+        params = self.model_params
+        carry, key = stages["embed"](params, rng_key, batch, None, None)
+        for cycle in range(self.num_trunk_passes):
+            carry, key, _ = stages["trunk"](params, rng_key, batch, carry, key)
+            logits = stages["distogram"](
+                params, rng_key, batch, carry, key)["distogram"]["distogram"]
+            if gate.after_pass(cycle, logits):
+                return None
+        return self._to_host(stages["score"](params, rng_key, batch, carry, key))
 
     def extract_embeddings(self, result, num_tokens: int):
         out = {}

@@ -15,7 +15,10 @@ NO_FP8_ATTENTION = {"chai1"}
 
 _CONFIG_KEYS = ("num_diffusion_samples", "use_dropout", "buckets", "download_weights",
                 "af3_pairing", "use_fast_kernels", "use_inexact_kernels", "use_esm", "weights_precision",
-                "accept_alphafold3_terms")
+                "accept_alphafold3_terms", "cyclecritic",
+                "cyclecritic_min_cycles", "cyclecritic_confidence_thresholds",
+                "cyclecritic_structure_thresholds", "cyclecritic_design",
+                "cyclecritic_binder_chain", "cyclecritic_trace")
 
 # Token counts to pad to, so a batch of mixed lengths compiles once per bucket
 # rather than once per length. Copied from run_alphafold.py's --buckets, which
@@ -46,6 +49,13 @@ def aligned_buckets(buckets):
     return aligned + list(beyond)
 
 _DEFAULTS = {
+    "cyclecritic": False,
+    "cyclecritic_min_cycles": 1,
+    "cyclecritic_confidence_thresholds": None,
+    "cyclecritic_structure_thresholds": None,
+    "cyclecritic_design": None,
+    "cyclecritic_binder_chain": None,
+    "cyclecritic_trace": False,
     "num_diffusion_samples": 5,
     "use_dropout": False,
     "buckets": BUCKETS,
@@ -116,6 +126,12 @@ class AF3Backend:
             resolve_model_name(self.model_type))
         logger.info(f"{self.model_type}: {recycles + 1} trunk pass(es) "
                     f"({'--num-recycle' if opts.num_recycles is not None else 'model default'})")
+        if self._opt(opts, "cyclecritic"):
+            design = self._opt(opts, "cyclecritic_design") or opts.initial_guess
+            logger.info(f"{self.model_type}: CycleCritic gating on, recycles driven "
+                        f"one pass at a time"
+                        + (f", scored against {design}" if design else
+                           " (no designed backbone: the confidence critic only)"))
 
     @staticmethod
     def _require_template_search() -> None:
@@ -129,7 +145,7 @@ class AF3Backend:
         ignored = []
         if opts.num_relax:
             ignored.append(("--amber", "alphafold3 results are not relaxed"))
-        if opts.initial_guess:
+        if opts.initial_guess and not self._opt(opts, "cyclecritic"):
             ignored.append(("--initial-guess", "diffusion takes no starting structure"))
         if opts.max_extra_seq is not None:
             ignored.append(("--max-msa", "only the first number is used"))
@@ -212,6 +228,7 @@ class AF3Backend:
     def predict(self, prefix: str, result_dir: Path, model_input, is_complex: bool,
                 sequences_lengths: List[int], opts: RunOptions,
                 prediction_callback=None) -> Dict[str, Any]:
+        from colabfold.alphafold3.cyclecritic import settings_from_options
         from colabfold.alphafold3.models import featurise
         from colabfold.alphafold3.predict import predict_structure
 
@@ -234,6 +251,7 @@ class AF3Backend:
             rank_by=opts.rank_by,
             stop_at_score=opts.stop_at_score,
             prediction_callback=prediction_callback,
+            gate_settings=settings_from_options(opts),
         )
 
     def config_dict(self, opts: RunOptions) -> Dict[str, Any]:

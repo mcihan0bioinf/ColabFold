@@ -785,6 +785,13 @@ def run(
     compile_cache         = kwargs.pop("compile_cache", None)
     compile_only          = kwargs.pop("compile_only", False)
     accept_alphafold3_terms = kwargs.pop("accept_alphafold3_terms", False)
+    cyclecritic           = kwargs.pop("cyclecritic", False)
+    cyclecritic_min_cycles = kwargs.pop("cyclecritic_min_cycles", 1)
+    cyclecritic_confidence_thresholds = kwargs.pop("cyclecritic_confidence_thresholds", None)
+    cyclecritic_structure_thresholds = kwargs.pop("cyclecritic_structure_thresholds", None)
+    cyclecritic_design    = kwargs.pop("cyclecritic_design", None)
+    cyclecritic_binder_chain = kwargs.pop("cyclecritic_binder_chain", None)
+    cyclecritic_trace     = kwargs.pop("cyclecritic_trace", False)
     if use_fast_kernels and not use_bfloat16:
         raise ValueError("--use-fast-kernels needs half precision, not use_bfloat16=False")
     max_msa               = kwargs.pop("max_msa",None)
@@ -796,6 +803,11 @@ def run(
 
     if len(kwargs) > 0:
         print(f"WARNING: the following options are not being used: {kwargs}")
+
+    if cyclecritic and not is_af3_model(model_type):
+        logger.warning(f"{model_type} ignores --cyclecritic: the critics read an "
+                       "alphafold3-style trunk's pair representation")
+        cyclecritic = False
 
     # decide how to rank outputs
     if is_af3_model(model_type):
@@ -877,6 +889,13 @@ def run(
             "compile_cache": compile_cache,
             "compile_only": compile_only,
             "accept_alphafold3_terms": accept_alphafold3_terms,
+            "cyclecritic": cyclecritic,
+            "cyclecritic_min_cycles": cyclecritic_min_cycles,
+            "cyclecritic_confidence_thresholds": cyclecritic_confidence_thresholds,
+            "cyclecritic_structure_thresholds": cyclecritic_structure_thresholds,
+            "cyclecritic_design": cyclecritic_design,
+            "cyclecritic_binder_chain": cyclecritic_binder_chain,
+            "cyclecritic_trace": cyclecritic_trace,
         },
     )
     backend.configure(
@@ -925,7 +944,8 @@ def run(
     use_amber = num_models > 0 and num_relax > 0
 
     bibtex_file = write_bibtex(
-        model_type if num_models > 0 else "", use_msa, use_env, use_templates, use_amber, result_dir
+        model_type if num_models > 0 else "", use_msa, use_env, use_templates, use_amber, result_dir,
+        use_cyclecritic=cyclecritic,
     )
 
     if pdb_hit_file is not None:
@@ -1130,7 +1150,9 @@ def run(
             ###############
 
             # load the scores
-            if not 'pae_json' in skip_output:
+            if not results["rank"]:
+                logger.info(f"{jobname}: no structure survived the CycleCritic gate")
+            elif not 'pae_json' in skip_output:
                 scores = []
                 for r in results["rank"][:5]:
                     scores_file = result_dir.joinpath(f"{jobname}_scores_{r}.json")
@@ -1522,6 +1544,60 @@ def build_parser(positional: bool = True) -> ArgumentParser:
         choices=["fp32", "int8"],
         default="int8",
     )
+    cc_group = parser.add_argument_group(
+        "CycleCritic arguments",
+        "Spend the recycling budget only where it pays: cheap critics read the trunk "
+        "after every recycle and stop a refold that will not clear the screening "
+        "filters, before diffusion and the confidence head run "
+        "(arXiv:2610.40665). Kill-only, so a refold that survives is folded exactly "
+        "as it would have been without a gate.",
+    )
+    cc_group.add_argument(
+        "--cyclecritic",
+        default=False,
+        action="store_true",
+        help="Score every recycle with the CycleCritics and stop hopeless refolds. "
+        "The trunk is then driven one pass at a time so the critics can read it.",
+    )
+    cc_group.add_argument(
+        "--cyclecritic-design",
+        help="The designed backbone a refold is meant to reproduce (mmCIF or PDB). "
+        "The structure critic needs it; without one only the confidence critic "
+        "runs. Defaults to --initial-guess when that is given.",
+    )
+    cc_group.add_argument(
+        "--cyclecritic-binder-chain",
+        help="Chain id of the binder, so 'interface' means binder-to-target. "
+        "Without it every cross-chain pair counts as interface.",
+    )
+    cc_group.add_argument(
+        "--cyclecritic-confidence-thresholds",
+        help="Per-recycle kill thresholds for the confidence critic, comma "
+        "separated and held at the last value past the end; 'off' disables this "
+        "critic. These are on the distogram-entropy ipTM proxy, which rises with "
+        "confidence, so the gate kills below the threshold.",
+    )
+    cc_group.add_argument(
+        "--cyclecritic-structure-thresholds",
+        help="Per-recycle kill thresholds for the structure critic. These are on "
+        "the interface distogram NLL, which rises with disagreement, so the gate "
+        "kills above the threshold. Needs --cyclecritic-design.",
+    )
+    cc_group.add_argument(
+        "--cyclecritic-min-cycles",
+        type=int,
+        default=1,
+        help="Trunk passes that must complete before any kill, so a pose has a "
+        "chance to form. The paper deploys 1.",
+    )
+    cc_group.add_argument(
+        "--cyclecritic-trace",
+        default=False,
+        action="store_true",
+        help="Record every recycle's critic scores in <job>_cyclecritic.json, which "
+        "is what you calibrate thresholds on.",
+    )
+
     af3_group.add_argument(
         "--af3-json",
         help="Generate input JSON for AlphaFold3 from the provided FASTA/A3M file.",
@@ -1926,6 +2002,13 @@ def run_args(args, compile_only: bool = False):
         weights_precision=args.weights_precision,
         buckets=parse_buckets(args.buckets),
         accept_alphafold3_terms=args.accept_alphafold3_terms,
+        cyclecritic=args.cyclecritic,
+        cyclecritic_min_cycles=args.cyclecritic_min_cycles,
+        cyclecritic_confidence_thresholds=args.cyclecritic_confidence_thresholds,
+        cyclecritic_structure_thresholds=args.cyclecritic_structure_thresholds,
+        cyclecritic_design=args.cyclecritic_design,
+        cyclecritic_binder_chain=args.cyclecritic_binder_chain,
+        cyclecritic_trace=args.cyclecritic_trace,
         compile_cache=compile_cache,
         compile_only=compile_only,
     )

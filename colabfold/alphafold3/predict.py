@@ -67,6 +67,34 @@ def rank_key(rank_by: str, scores: Dict[str, Any]) -> float:
     return float(scores.get(rank_by, scores["ranking_score"]))
 
 
+def build_gate(gate_settings, model_runner, fold_input, example):
+    """One :class:`colabfold.alphafold3.cyclecritic.CycleGate` for one refold."""
+    from colabfold.alphafold3.cyclecritic import CycleGate
+
+    gate = CycleGate(
+        gate_settings,
+        distogram_config=model_runner.distogram_config,
+        asym_id=example["asym_id"],
+        token_mask=example["seq_mask"],
+        chain_letters=[chain.id for chain in fold_input.chains],
+    )
+    gate.load_reference(example["residue_index"])
+    return gate
+
+
+def _gate_summary(reports: Dict[int, Dict[str, Any]], full_passes: int) -> str:
+    killed = [r for r in reports.values() if r["killed"]]
+    passes = [r["trunk_passes"] for r in reports.values()]
+    mean = sum(passes) / len(passes)
+    by_critic = {}
+    for report in killed:
+        by_critic[report["killed_by"]] = by_critic.get(report["killed_by"], 0) + 1
+    tail = "".join(f", {n} by the {critic} critic" for critic, n in sorted(by_critic.items()))
+    return (f"CycleCritic stopped {len(killed)} of {len(reports)} refold(s){tail}; "
+            f"mean trunk depth {mean:.2f} of {full_passes} pass(es) "
+            f"({100 * (1 - mean / full_passes):.1f}% fewer)")
+
+
 def predict_structure(
     prefix: str,
     result_dir: Path,
@@ -78,17 +106,33 @@ def predict_structure(
     rank_by: str = "auto",
     stop_at_score: float = 100.0,
     prediction_callback=None,
+    gate_settings=None,
 ) -> Dict[str, Any]:
     import jax
     from alphafold3.model import post_processing
 
     ranked, best = [], -float("inf")
+    gate_reports: Dict[int, Dict[str, Any]] = {}
+    extra_files: List[Path] = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
         if best >= stop_at_score:
             logger.info(f"stopping early, {rank_by} reached {best:.3f}")
             break
         start = time.time()
-        result = model_runner.run_inference(example, jax.random.PRNGKey(seed))
+        if gate_settings is not None:
+            gate = build_gate(gate_settings, model_runner, fold_input, example)
+            result = model_runner.run_inference_gated(
+                example, jax.random.PRNGKey(seed), gate)
+            gate_reports[seed] = gate.report()
+            if result is None:
+                report = gate_reports[seed]
+                logger.info(f"{model_type}_seed_{seed:03d}: the {report['killed_by']} "
+                            f"CycleCritic stopped this refold after "
+                            f"{report['trunk_passes']} trunk pass(es) "
+                            f"({time.time() - start:.1f}s)")
+                continue
+        else:
+            result = model_runner.run_inference(example, jax.random.PRNGKey(seed))
         inference_results = model_runner.extract_inference_results(
             batch=example, result=result, target_name=fold_input.name
         )
@@ -106,10 +150,19 @@ def predict_structure(
                 prediction_callback(inference_result.predicted_structure, None,
                                     scores, example, (tag, False))
 
+    if gate_reports:
+        logger.info(_gate_summary(gate_reports, model_runner.num_trunk_passes))
+        gate_file = result_dir.joinpath(f"{prefix}_cyclecritic.json")
+        gate_file.write_text(json.dumps(
+            {"full_trunk_passes": model_runner.num_trunk_passes,
+             "seeds": {str(seed): report for seed, report in gate_reports.items()}},
+            indent=2))
+        extra_files.append(gate_file)
+
     logger.info(f"reranking models by '{rank_by}' metric")
     ranked.sort(key=lambda row: row[0], reverse=True)
 
-    rank, metric, result_files = [], [], []
+    rank, metric, result_files = [], [], list(extra_files)
     for n, (_, tag, processed, scores, took, embeddings, logits) in enumerate(ranked):
         new_tag = f"rank_{(n + 1):03d}_{tag}"
         rank.append(new_tag)
